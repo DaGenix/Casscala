@@ -37,27 +37,29 @@ object CassandraPool {
 
   sealed trait CassandraResult
   final case class Result(responseMessage: ResponseMessage, tag: Any) extends CassandraResult
-  final case class Error(reason: String) extends CassandraResult
+  final case class Error(reason: String, tag: Any) extends CassandraResult
 
   private[cassandra] case class RequestInfo(requestor: ActorRef, num: Long, request: Request)
   private[cassandra] case class ResultInfo(inResponseTo: RequestInfo, responseMessage: ResponseMessage)
   private[cassandra] case class ChildConnected(child: ActorRef)
 }
 
-class CassandraConnectionActor(socketActor: ActorRef) extends Actor {
+class CassandraConnectionActor(tcpActor: ActorRef, addr: InetSocketAddress) extends Actor {
   import scala.collection.mutable
   import CassandraDefs._
   import CassandraMarshallingFuncs.marshall
   import CassandraPool._
 
-  val unusedStreams = mutable.Set() ++ (0 to 126) // 127 reserved for the register message
-  val pendingRequests = mutable.Map[Byte, RequestInfo]()
+  type StreamId = Byte
+
+  val unusedStreams = mutable.Set() ++ (0 to 127)
+
+  val pendingRequests = mutable.Map[StreamId, RequestInfo]()
+
+  var socketActor: ActorRef = null
 
   override def preStart() = {
-    socketActor ! Tcp.Register(self)
-    context.watch(socketActor)
-
-    socketActor ! Tcp.Write(marshall(0, StartupMessage(Map())))
+    tcpActor ! Tcp.Connect(addr)
   }
 
   val ref = IterateeRef.sync(repeat(for {
@@ -65,6 +67,9 @@ class CassandraConnectionActor(socketActor: ActorRef) extends Actor {
   } yield {
     val header = r._1
     val response = r._2
+
+    unusedStreams += header.stream
+
     println("CHILD: " + response)
     response match {
       case ReadyMessage =>
@@ -76,34 +81,41 @@ class CassandraConnectionActor(socketActor: ActorRef) extends Actor {
       case m: ResponseMessage =>
         pendingRequests.remove(header.stream) match {
           case Some(ri: RequestInfo) =>
-            unusedStreams += header.stream
             context.parent ! ResultInfo(ri, response)
           case None => println("Response message on unexpected stream!")
         }
     }
   }))
 
+  def send(message: RequestMessage): StreamId = {
+    val stream = unusedStreams.head.toByte
+    unusedStreams -= stream
+    socketActor ! Tcp.Write(marshall(stream, message))
+    stream
+  }
+
   def receive = {
     case r: RegisterMessage =>
-      socketActor ! Tcp.Write(marshall(127, r))
+      send(r)
 
     case ri @ RequestInfo(_, _, Request(req, _)) =>
       if (unusedStreams.size == 0) {
         // TODO - handle this better
         println("NO UNUSED STREAMS!")
       } else {
-        val stream = unusedStreams.head.toByte
-        unusedStreams -= stream
+        val stream = send(req)
         pendingRequests += (stream -> ri)
-        println("CHILD - SENDING REQUEST: " + marshall(stream, req))
-        socketActor ! Tcp.Write(marshall(stream, req))
       }
 
     //
     // IO
-    // 
+    //
+    case _: Tcp.Connected =>
+      socketActor = sender
+      socketActor ! Tcp.Register(self)
+      context.watch(socketActor)
+      send(StartupMessage(Map()))
     case Tcp.Received(data) =>
-      println("CHILD - DATA: " + data)
       ref(Chunk(data))
     case _: Tcp.ConnectionClosed =>
       context.stop(self)
@@ -120,10 +132,17 @@ class CassandraPoolActor(val tcpActor: ActorRef) extends Actor {
   import scala.collection.mutable
 
   // Map of ActorRef of CassandraConnectionActor -> RequestInfo
-  val inflightRequests = mutable.Map[ActorRef, Seq[RequestInfo]]()
+  val inflightRequests = mutable.Map[ActorRef, mutable.Set[RequestInfo]]()
+
+  // Any requests that show up before the first child has finished connecting
+  // get queued here until that child connects
+  val queuedRequests = mutable.ListBuffer[RequestInfo]()
 
   // List of all child actors that are managing connections
   val connActors = mutable.Set[ActorRef]()
+
+  // List of all child actors that are trying to connect
+  val pendingConnActors = mutable.Set[ActorRef]()
 
   // List of all hosts that we know about
   val knownHosts = mutable.Set[InetSocketAddress]()
@@ -133,25 +152,61 @@ class CassandraPoolActor(val tcpActor: ActorRef) extends Actor {
 
   var requestNum = 0L
 
-  def receive = {
+  def handleChildReady(childRef: ActorRef) {
+    connActors += childRef
+    pendingConnActors -= childRef
+
+    if (gossipActor == null) {
+      gossipActor = childRef
+      childRef ! RegisterMessage(Seq("TOPOLOGY_CHANGE", "STATUS_CHANGE", "SCHEMA_CHANGE"))
+    }
+  }
+
+  def receive = startup
+
+  def startup: Receive = {
     //
     // Commands
     //
     case Bootstrap(hosts) =>
       this.knownHosts ++= hosts
       for (host <- hosts) {
-        tcpActor ! Tcp.Connect(host)
+        val connAct = context.actorOf(Props(new CassandraConnectionActor(tcpActor, host)))
+        context.watch(connAct)
       }
 
+    // TODO - what about Shutdown?
+
+    case r: Request =>
+      queuedRequests += RequestInfo(sender, requestNum, r)
+      requestNum += 1
+
+    //
+    // Child handling
+    //
+    case ChildConnected(childRef) =>
+      handleChildReady(childRef)
+      for (r <- queuedRequests) {
+        val child = connActors.head
+        child ! r
+      }
+      queuedRequests.clear()
+      context.become(running)
+
+    case m => println("Unexpected Message: " + m)
+  }
+
+  def running: Receive = {
     case Shutdown =>
-      // TODO - fail all pending requests
+      for (ri <- queuedRequests) {
+        ri.requestor ! Error("Shutdown!", ri.request.tag)
+      }
       context.stop(self)
 
     case r: Request =>
       if (connActors.size == 0) {
-        sender ! new Exception("No connections!")
+        sender ! Error("No connections!", r.tag)
       } else {
-        // TODO - do a better job of picking a child actor
         val child = connActors.head
         child ! RequestInfo(sender, requestNum, r)
         requestNum += 1
@@ -161,34 +216,23 @@ class CassandraPoolActor(val tcpActor: ActorRef) extends Actor {
     // Response handling
     //
     case ResultInfo(ri, responseMessage) =>
+      for (ifr <- inflightRequests.get(sender)) {
+        ifr -= ri
+      }
       ri.requestor ! Result(responseMessage, ri.request.tag)
-
-    //
-    // IO related stuff
-    //
-    case Tcp.Connected(_, _) =>
-      val s = sender
-      val connAct = context.actorOf(Props(new CassandraConnectionActor(s)))
-      context.watch(connAct)
-    // Note: Not added to connActors until it completes connecting
 
     //
     // Child handling
     //
     case ChildConnected(childRef) =>
-      connActors += childRef
-
-      if (gossipActor == null) {
-        gossipActor = childRef
-        childRef ! RegisterMessage(Seq("TOPOLOGY_CHANGE", "STATUS_CHANGE", "SCHEMA_CHANGE"))
-      }
+      handleChildReady(childRef)
 
     case Terminated(actor) =>
       // Complete all pending requests with an error
       connActors -= actor
       for (requests <- inflightRequests.remove(actor); ri <- requests) {
         // TODO - Better error!
-        ri.requestor ! new Exception("Failed!")
+        ri.requestor ! Error("Child actor Failed!", ri.request.tag)
       }
 
       if (gossipActor == actor) {
@@ -208,17 +252,13 @@ object Test extends App {
   val tcpActor = IO(Tcp)
   val server = system.actorOf(Props(new CassandraPoolActor(tcpActor)))
 
-  server ! Bootstrap(List(new InetSocketAddress("localhost", 9042)))
+  server ! Bootstrap(Seq(new InetSocketAddress("localhost", 9042)))
 
-  Thread.sleep(2000)
-
-  val test = akka.util.Timeout
   implicit val timeout = akka.util.Timeout(30 seconds)
   val result = server ? Request(QueryMessage("select * from system.schema_columns;", OneConsistency), None)
 
-  result onComplete {
-    r =>
-      println("GOT: " + r)
+  result onComplete { r =>
+    println("GOT: " + r)
   }
 
   System.in.read()
