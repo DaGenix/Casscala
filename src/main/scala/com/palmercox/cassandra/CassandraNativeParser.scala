@@ -119,7 +119,7 @@ object CassandraDefs {
 
   sealed trait ResultMessage extends ResponseMessage
   final case object VoidResultMessage extends ResultMessage
-  final case class RowsResultMessage(rowCount: Int, rows: Seq[Seq[Any]]) extends ResultMessage
+  final case class RowsResultMessage(rows: Seq[Seq[Any]]) extends ResultMessage
 
   final case class SetKeyspaceResultMessage(keyspace: String) extends ResultMessage
   final case class PrepareResultMessage(id: Array[Byte], metadata: RowsResultMetadata) extends ResultMessage
@@ -544,8 +544,16 @@ private object CassandraParsingFuncs {
     } yield for {
       columnSpec <- rowMetadata.columnSpecs
     } yield {
-      val len = getInt
 
+      // Parsing rules seem to be different inside a collection. This method will parse a value
+      // inside a collection using those rules
+      def parseCollectionValue(valType: RowValueType): Any = {
+        valType match {
+          case VarcharRowValueType => getString
+        }
+      }
+
+      val len = getInt
       if (len >= 0) {
         columnSpec.columnType match {
           //          case CustomRowValueType => ???
@@ -565,17 +573,26 @@ private object CassandraParsingFuncs {
           //          case VarintRowValueType => ???
           //          case TimeuuidRowValueType => UUIDRowValue(getUUID)
           //          case InetRowValueType => InetRowValue(getInet)
-          //          case ListRowValueType(_) => ???
-          //          case MapRowValueType(_, _) => ???
-          //          case SetRowValueType(_) => ???
-          case _ => throw new Exception(s"Unfortunatley, parsing values of type $columnSpec.columnType is not implemented.")
+          case ListRowValueType(t) =>
+            // TODO: Test this!
+            println("UNTESTED!")
+            val count = getShort
+            Set() ++ (for (_ <- 1 to count) yield parseCollectionValue(t))
+          case MapRowValueType(k, v) =>
+            // TODO: Test this!
+            println("UNTESTED!")
+            val count = getShort
+            Map() ++ (for (_ <- 1 to count) yield (parseCollectionValue(k) -> parseCollectionValue(v)))
+          case SetRowValueType(t) =>
+            val count = getShort
+            Set() ++ (for (_ <- 1 to count) yield parseCollectionValue(t))
         }
       } else {
         null
       }
     }
 
-    RowsResultMessage(rowsCount, rows)
+    RowsResultMessage(rows)
   }
 
   def parseResultMessage(implicit it: ByteIterator): ResultMessage = {
