@@ -14,8 +14,8 @@ resolvers ++= Seq(
 	"Typesafe Repository" at "http://repo.typesafe.com/typesafe/releases/")
 
 libraryDependencies ++= Seq(
-	"io.spray" % "spray-io" % "1.1-20130331",
-	"io.spray" % "spray-can" % "1.1-20130331",
+	"io.spray" % "spray-io" % "1.1-20130416",
+	"io.spray" % "spray-can" % "1.1-20130416",
 	"com.typesafe.akka" %% "akka-actor" % "2.1.0",
 	"com.typesafe.akka" %% "akka-osgi" % "2.1.0",
 	"org.scalaz" %% "scalaz-core" % "7.0.0-M9",
