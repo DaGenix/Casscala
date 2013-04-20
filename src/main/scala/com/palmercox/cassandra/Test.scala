@@ -198,7 +198,7 @@ object ChildTracker {
   case class BootstrapData(
     knownHosts: Set[InetSocketAddress],
     childHost: Map[ActorRef, InetSocketAddress],
-    queuedRequests: Seq[Execute]) extends Data
+    queuedRequests: Seq[ExecuteInfo]) extends Data
   case class PickingGossiperData(
     knownHosts: Set[InetSocketAddress],
     childHost: Map[ActorRef, InetSocketAddress],
@@ -217,40 +217,30 @@ object ChildTracker {
 
 trait MessageSender { me: Actor =>
   import CassandraPool._
-
-  import ChildTracker._
-  import CassandraPool._
   import scala.collection.immutable._
-  import scala.concurrent.duration._
 
   def sendMessage(
     inflight: Map[ActorRef, Set[ExecuteInfo]],
     child: ActorRef,
-    requestMessage: RequestMessage,
-    onSuccess: ResponseMessage => Unit,
-    onFailure: String => Unit): Map[ActorRef, Set[ExecuteInfo]] = {
+    execInfo: ExecuteInfo): Map[ActorRef, Set[ExecuteInfo]] = {
 
-    val execInfo = ExecuteInfo(requestMessage, onSuccess, onFailure)
     child ! execInfo
 
     inflight + (child -> (inflight.getOrElse(child, Set()) + execInfo))
   }
 
   def delegate(
-    inflight: Map[ActorRef, Set[ExecuteInfo]],
-    child: ActorRef,
-    requestMessage: RequestMessage,
-    tag: Any): Map[ActorRef, Set[ExecuteInfo]] = {
+    exec: Execute): ExecuteInfo = {
 
     val requestor = sender
     def onSuccess(responseMessage: ResponseMessage) {
-      requestor ! Completed(responseMessage, tag)
+      requestor ! Completed(responseMessage, exec.tag)
     }
     def onFailure(reason: String) {
-      requestor ! Error(reason, tag)
+      requestor ! Error(reason, exec.tag)
     }
 
-    sendMessage(inflight, child, requestMessage, onSuccess, onFailure)
+    ExecuteInfo(exec.message, onSuccess, onFailure)
   }
 
   def completeMessage(
@@ -300,8 +290,7 @@ class CassandraPoolActor(val tcpActor: ActorRef, initialHosts: Traversable[InetS
     readyChildren.toSeq(rand.nextInt(readyChildren.size))
   }
 
-  @tailrec
-  private def bestChild(tokens: SortedMap[Long, ActorRef], hint: Option[Long]): ActorRef = {
+  def bestChild(tokens: SortedMap[Long, ActorRef], hint: Option[Long]): ActorRef = {
     hint match {
       case Some(h) =>
         val proj = tokens.to(h)
@@ -337,13 +326,13 @@ class CassandraPoolActor(val tcpActor: ActorRef, initialHosts: Traversable[InetS
 
   when(BootstrapState) {
     case Event(exec: Execute, d: BootstrapData) =>
-      stay using (d.copy(queuedRequests = d.queuedRequests :+ exec))
+      stay using (d.copy(queuedRequests = d.queuedRequests :+ delegate(exec)))
 
     case Event(ChildReady, d: BootstrapData) =>
       val newChild = sender
 
-      val newInflight = d.queuedRequests.foldRight[Map[ActorRef, Set[ExecuteInfo]]](Map()) { (exec, accum) =>
-        delegate(accum, newChild, exec.message, exec.tag)
+      val newInflight = d.queuedRequests.foldRight[Map[ActorRef, Set[ExecuteInfo]]](Map()) { (execInfo, accum) =>
+        sendMessage(accum, newChild, execInfo)
       }
 
       // TODO - kick off gossip setup queries
@@ -372,7 +361,7 @@ class CassandraPoolActor(val tcpActor: ActorRef, initialHosts: Traversable[InetS
 
   when(PickingGossiperState) {
     case Event(exec: Execute, d: PickingGossiperData) =>
-      val newInflight = delegate(d.inflight, randomChild(d.readyChildren), exec.message, exec.tag)
+      val newInflight = sendMessage(d.inflight, randomChild(d.readyChildren), delegate(exec))
       stay using d.copy(inflight = newInflight)
 
     case Event(ChildReady, d: PickingGossiperData) =>
@@ -382,6 +371,8 @@ class CassandraPoolActor(val tcpActor: ActorRef, initialHosts: Traversable[InetS
       for (host <- d.childHost.get(child)) {
         context.system.scheduler.scheduleOnce(30 seconds, self, RetryChild(host))
       }
+
+      failChildMessages(d.inflight, child)
 
       val newReadyChilren = d.readyChildren - child
       if (newReadyChilren.isEmpty) {
@@ -438,8 +429,6 @@ object Test extends App {
     val tcpActor = IO(Tcp)
     val server = system.actorOf(Props(new CassandraPoolActor(tcpActor, Seq(new InetSocketAddress("127.0.1.1", 9042)))))
 
-    Thread.sleep(500)
-
     implicit val timeout = akka.util.Timeout(30 seconds)
     val result = server ? Execute(QueryMessage("select key, tokens from system.local;", OneConsistency), None)
 
@@ -453,7 +442,6 @@ object Test extends App {
             //          }
             println(row)
           }
-        case _ =>
       }
     }
   } finally {
